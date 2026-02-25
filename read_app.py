@@ -5,6 +5,7 @@ import re
 import json
 import time
 import random
+import html
 import datetime as dt
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -31,7 +32,14 @@ DATA_DIR.mkdir(exist_ok=True)
 
 LOG_PATH = DATA_DIR / "reading_trainer_log.csv"
 
-DEFAULT_MODEL = "gemini-1.5-flash"  # change if you prefer
+DEFAULT_MODEL = "gemini-2.0-flash"  # change if you prefer
+MODEL_FALLBACK_CANDIDATES = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro",
+]
 
 
 # -----------------------------
@@ -180,9 +188,9 @@ def apply_help_to_chunks(chunks: List[str], help_level: int) -> str:
             show_marker = (i % 2 == 0)
 
         if help_level >= 3:
-            c_html = f"<span style='font-weight:700'>{st.escape(c)}</span>"
+            c_html = f"<span style='font-weight:700'>{html.escape(c)}</span>"
         else:
-            c_html = st.escape(c)
+            c_html = html.escape(c)
 
         if help_level >= 4:
             c_html = (
@@ -192,7 +200,7 @@ def apply_help_to_chunks(chunks: List[str], help_level: int) -> str:
 
         styled.append(c_html)
         if show_marker and i != len(chunks) - 1:
-            styled.append(f"<span style='opacity:0.35'>{st.escape(mark)}</span>")
+            styled.append(f"<span style='opacity:0.35'>{html.escape(mark)}</span>")
 
     return "".join(styled)
 
@@ -208,12 +216,74 @@ def local_generate_text(kind: str, approx_words: int) -> str:
     return " ".join(words[:approx_words])
 
 
+def _normalize_model_name(model: str) -> str:
+    model = (model or "").strip()
+    if not model:
+        return f"models/{DEFAULT_MODEL}"
+    if model.startswith("models/"):
+        return model
+    return f"models/{model}"
+
+
+def resolve_model_for_generate(api_key: str, requested_model: str) -> str:
+    """
+    Resolve to a model that supports generateContent for the current key/project.
+    Falls back to the requested model if discovery fails.
+    """
+    if genai is None:
+        return _normalize_model_name(requested_model)
+
+    cache_key = f"{api_key[:6]}::{requested_model}"
+    cache = st.session_state.setdefault("_resolved_model_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
+    normalized = _normalize_model_name(requested_model)
+
+    try:
+        genai.configure(api_key=api_key)
+        models = list(genai.list_models())
+
+        supported = []
+        for m in models:
+            methods = getattr(m, "supported_generation_methods", None) or []
+            name = getattr(m, "name", "")
+            if "generateContent" in methods and name:
+                supported.append(name)
+
+        if normalized in supported:
+            cache[cache_key] = normalized
+            return normalized
+
+        short_requested = normalized.replace("models/", "", 1)
+        for name in supported:
+            if name.endswith(short_requested):
+                cache[cache_key] = name
+                return name
+
+        for cand in MODEL_FALLBACK_CANDIDATES:
+            n = _normalize_model_name(cand)
+            if n in supported:
+                cache[cache_key] = n
+                return n
+
+        if supported:
+            cache[cache_key] = supported[0]
+            return supported[0]
+    except Exception:
+        pass
+
+    cache[cache_key] = normalized
+    return normalized
+
+
 def llm_generate_text(api_key: str, model: str, kind: str, approx_words: int) -> str:
     if genai is None:
         raise RuntimeError("google-generativeai is not installed, so LLM generation isn't available.")
 
     genai.configure(api_key=api_key)
-    m = genai.GenerativeModel(model)
+    resolved_model = resolve_model_for_generate(api_key, model)
+    m = genai.GenerativeModel(resolved_model)
 
     # Keep it safe + consistent: fictional, original, neutral
     prompt = f"""
@@ -287,7 +357,8 @@ def llm_make_quiz(api_key: str, model: str, text: str, n_q: int = 6) -> Dict[str
         raise RuntimeError("google-generativeai is not installed, so LLM quiz generation isn't available.")
 
     genai.configure(api_key=api_key)
-    m = genai.GenerativeModel(model)
+    resolved_model = resolve_model_for_generate(api_key, model)
+    m = genai.GenerativeModel(resolved_model)
 
     prompt = f"""
 Create {n_q} multiple-choice comprehension questions about the passage below.
@@ -310,7 +381,10 @@ PASSAGE:
 \"\"\"{text}\"\"\"
 """.strip()
 
-    resp = m.generate_content(prompt)
+    try:
+        resp = m.generate_content(prompt)
+    except Exception:
+        return local_make_quiz(text, n_q=min(5, n_q))
     raw = (getattr(resp, "text", "") or "").strip()
 
     # Try to parse JSON robustly
@@ -342,7 +416,10 @@ def compute_passage_for_A(
     approx_words: int,
 ) -> str:
     if use_llm and api_key:
-        return llm_generate_text(api_key, model, kind="Technique A (chunking phrases)", approx_words=approx_words)
+        try:
+            return llm_generate_text(api_key, model, kind="Technique A (chunking phrases)", approx_words=approx_words)
+        except Exception as e:
+            st.warning(_friendly_llm_error("passage generation", e))
     return local_generate_text("A", approx_words)
 
 
@@ -353,8 +430,27 @@ def compute_passage_for_B(
     approx_words: int,
 ) -> str:
     if use_llm and api_key:
-        return llm_generate_text(api_key, model, kind="Technique B (moving underline)", approx_words=approx_words)
+        try:
+            return llm_generate_text(api_key, model, kind="Technique B (moving underline)", approx_words=approx_words)
+        except Exception as e:
+            st.warning(_friendly_llm_error("passage generation", e))
     return local_generate_text("B", approx_words)
+
+
+def _friendly_llm_error(action: str, exc: Exception) -> str:
+    msg = str(exc)
+    msg_l = msg.lower()
+    if "429" in msg or "quota" in msg_l or "rate limit" in msg_l:
+        return (
+            f"Gemini {action} is rate-limited or out of quota right now; "
+            "using local text instead. Try again in about a minute or use a billed key."
+        )
+    if "404" in msg and "model" in msg_l:
+        return (
+            f"Gemini {action} failed because the selected model is unavailable for this key; "
+            "using local text instead."
+        )
+    return f"Gemini {action} failed; using local text instead."
 
 
 def render_pacer(text: str, wpm: int) -> None:
