@@ -6,6 +6,8 @@ from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
+import json
+import re
 
 # Optional LLM support
 try:
@@ -51,6 +53,7 @@ def default_weekly_engine(weeks: int = 52) -> pd.DataFrame:
 
 def compute_pages_read(df_weekly: pd.DataFrame) -> pd.DataFrame:
     df = df_weekly.copy()
+
     for label, _req in SESSION_COLS:
         start = pd.to_numeric(df[f"{label} Start Pg"], errors="coerce")
         end = pd.to_numeric(df[f"{label} End Pg"], errors="coerce")
@@ -60,8 +63,13 @@ def compute_pages_read(df_weekly: pd.DataFrame) -> pd.DataFrame:
 
     page_cols = [f"{label} Pages Read" for label, _ in SESSION_COLS]
     min_cols = [f"{label} Minutes" for label, _ in SESSION_COLS]
-    df["Week Pages Read"] = pd.to_numeric(df[page_cols].sum(axis=1, skipna=True), errors="coerce")
-    df["Week Minutes"] = pd.to_numeric(pd.to_numeric(df[min_cols], errors="coerce").sum(axis=1, skipna=True), errors="coerce")
+
+    pages_df = df[page_cols].apply(pd.to_numeric, errors="coerce")
+    mins_df = df[min_cols].apply(pd.to_numeric, errors="coerce")
+
+    df["Week Pages Read"] = pages_df.sum(axis=1, skipna=True)
+    df["Week Minutes"] = mins_df.sum(axis=1, skipna=True)
+
     return df
 
 def book_progress(df_books: pd.DataFrame, df_weekly: pd.DataFrame) -> pd.DataFrame:
@@ -154,11 +162,45 @@ Output STRICT JSON array, length {weeks}, where each element has:
   "Optional": {{"slot":"S5","Book":"<one of allowed names or empty>","Minutes":<int>}}  // optional can be null
 }}
 """
-    resp = client.models.generate_content(model=model, contents=prompt)
-    text = resp.text
 
-    import json
-    data = json.loads(text)
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "temperature": 0.4,
+        },
+    )
+
+    text = (resp.text or "").strip()
+
+    def extract_json(s: str) -> str:
+        fence = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+        if fence:
+            return fence.group(1).strip()
+
+        start_candidates = [i for i in [s.find("["), s.find("{")] if i != -1]
+        if not start_candidates:
+            return s
+        start = min(start_candidates)
+
+        end_candidates = [s.rfind("]"), s.rfind("}")]
+        end = max(end_candidates)
+        if end == -1:
+            return s
+
+        return s[start:end + 1].strip()
+
+    json_str = extract_json(text)
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "Gemini did not return valid JSON. "
+            "Try again or tighten the prompt.\n"
+            f"First 300 chars:\n{json_str[:300]}"
+        )
 
     # Build weekly engine skeleton
     df = default_weekly_engine(weeks=weeks)
@@ -229,7 +271,15 @@ with tabs[0]:
     with col3:
         prefs = st.text_area(
             "Plan preferences (used only when generating)",
-            value="4 sessions/week with optional buffer. Alternate thriller and nonfiction. GOT gets longer sessions.",
+            value="Design a 12-month phased reading plan. " \
+            "Months 1-3: Establish rhythm, finish current GOT book, light thriller. " \
+            "Months 4-6: Increase thriller intensity, maintain nonfiction depth. " \
+            "Months 7-9: Heavier nonfiction focus, slightly reduce fiction load. " \
+            "Months 10-12: Peak narrative momentum (major thriller or GOT push). " \
+            "Rules: Avoid repeating identical weekly structures for more than 4 consecutive weeks. " \
+            "Gradually adjust session minutes over the year." \
+            "Ensure cognitive balance (no heavy nonfiction immediately after another heavy session). " \
+            "Return ONLY valid JSON. No markdown. No commentary. No code fences.",
             height=80,
         )
 
