@@ -19,7 +19,7 @@ except Exception:
 # -----------------------------
 # Defaults / schema
 # -----------------------------
-BOOK_STATUSES = ["Wishlist", "Active", "Paused", "Finished"]
+BOOK_STATUSES = ["Stream", "Wishlist", "Active", "Paused", "Finished"]
 
 SESSION_COLS = [
     # 5 sessions (S5 optional)
@@ -33,9 +33,9 @@ SESSION_COLS = [
 def default_book_list() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"Book": "Dan Brown (rotate)", "Status": "Active", "Total Pages": 0, "Notes": ""},
-            {"Book": "Game of Thrones (current)", "Status": "Active", "Total Pages": 0, "Notes": ""},
-            {"Book": "Nonfiction (modular)", "Status": "Active", "Total Pages": 0, "Notes": ""},
+            {"Book": "Dan Brown (rotate)", "Status": "Stream", "Total Pages": 0, "Notes": ""},
+            {"Book": "Game of Thrones (current)", "Status": "Stream", "Total Pages": 0, "Notes": ""},
+            {"Book": "Nonfiction (modular)", "Status": "Stream", "Total Pages": 0, "Notes": ""},
         ]
     )
 
@@ -44,12 +44,45 @@ def default_weekly_engine(weeks: int = 52) -> pd.DataFrame:
     for w in range(1, weeks + 1):
         row: Dict[str, Any] = {"Week": w, "Phase": ""}
         for label, _required in SESSION_COLS:
-            row[f"{label} Book"] = ""
+            # Planned = stream (filled by Gemini)
+            row[f"{label} Planned"] = ""
+            # Actual = real book read during the session
+            row[f"{label} Actual"] = ""
             row[f"{label} Start Pg"] = None
             row[f"{label} End Pg"] = None
             row[f"{label} Minutes"] = None
         rows.append(row)
     return pd.DataFrame(rows)
+
+def normalize_weekly_schema(df_weekly: pd.DataFrame) -> pd.DataFrame:
+    """Backfill missing planned/actual columns and migrate legacy '* Book' data."""
+    df = df_weekly.copy()
+    if "Week" not in df.columns:
+        df["Week"] = range(1, len(df) + 1)
+    if "Phase" not in df.columns:
+        df["Phase"] = ""
+
+    for label, _required in SESSION_COLS:
+        legacy_book_col = f"{label} Book"
+        planned_col = f"{label} Planned"
+        actual_col = f"{label} Actual"
+
+        if planned_col not in df.columns:
+            if legacy_book_col in df.columns:
+                df[planned_col] = df[legacy_book_col]
+            else:
+                df[planned_col] = ""
+        if actual_col not in df.columns:
+            if legacy_book_col in df.columns:
+                df[actual_col] = df[legacy_book_col]
+            else:
+                df[actual_col] = ""
+
+        for col_name in [f"{label} Start Pg", f"{label} End Pg", f"{label} Minutes"]:
+            if col_name not in df.columns:
+                df[col_name] = None
+
+    return df
 
 def compute_pages_read(df_weekly: pd.DataFrame) -> pd.DataFrame:
     df = df_weekly.copy()
@@ -81,7 +114,7 @@ def book_progress(df_books: pd.DataFrame, df_weekly: pd.DataFrame) -> pd.DataFra
     # Build long-form log: (Book, PagesRead)
     logs = []
     for label, _ in SESSION_COLS:
-        b = dfw[f"{label} Book"].fillna("").astype(str)
+        b = dfw[f"{label} Actual"].fillna("").astype(str)
         p = pd.to_numeric(dfw[f"{label} Pages Read"], errors="coerce").fillna(0)
         logs.append(pd.DataFrame({"Book": b, "PagesRead": p}))
     long = pd.concat(logs, ignore_index=True)
@@ -127,7 +160,7 @@ def generate_plan_with_gemini(
     preferences: str,
 ) -> pd.DataFrame:
     """
-    Returns a weekly_engine-like DataFrame with Week/Phase and session Book/Minutes filled.
+    Returns a weekly_engine-like DataFrame with Week/Phase and session Planned/Minutes filled.
     Does NOT fill page ranges (user logs those).
     """
     if genai is None:
@@ -147,6 +180,7 @@ Constraints:
 
 Allowed book streams (use only these names exactly):
 {streams}
+These should populate the 'Sx Planned' fields.
 
 Preferences:
 {preferences}
@@ -214,12 +248,12 @@ Output STRICT JSON array, length {weeks}, where each element has:
             slot = s.get("slot", "")
             if slot not in [f"S{i}" for i in range(1, 6)]:
                 continue
-            df.loc[df["Week"] == w, f"{slot} Book"] = s.get("Book", "")
+            df.loc[df["Week"] == w, f"{slot} Planned"] = s.get("Book", "")
             df.loc[df["Week"] == w, f"{slot} Minutes"] = s.get("Minutes", None)
 
         opt = item.get("Optional", None)
         if isinstance(opt, dict):
-            df.loc[df["Week"] == w, "S5 Book"] = opt.get("Book", "")
+            df.loc[df["Week"] == w, "S5 Planned"] = opt.get("Book", "")
             df.loc[df["Week"] == w, "S5 Minutes"] = opt.get("Minutes", None)
 
     return df
@@ -237,6 +271,7 @@ if "books" not in st.session_state:
     st.session_state.books = default_book_list()
 if "weekly" not in st.session_state:
     st.session_state.weekly = default_weekly_engine(weeks=52)
+st.session_state.weekly = normalize_weekly_schema(st.session_state.weekly)
 
 tabs = st.tabs(["Book list", "Weekly engine", "Summary"])
 
@@ -297,7 +332,10 @@ with tabs[0]:
         if not api_key:
             st.error("Enter your Gemini API key (or skip this feature).")
         else:
-            streams = get_book_options(st.session_state.books)
+            stream_rows = st.session_state.books[st.session_state.books["Status"] == "Stream"]
+            streams = get_book_options(stream_rows)
+            if not streams:
+                streams = get_book_options(st.session_state.books)
             try:
                 df_new = generate_plan_with_gemini(
                     api_key=api_key,
@@ -319,17 +357,23 @@ with tabs[1]:
     st.subheader("Weekly engine (log sessions)")
 
     df_books = st.session_state.books
-    book_options = [""] + get_book_options(df_books)
+    planned_options = [""] + get_book_options(df_books[df_books["Status"] == "Stream"])
+    actual_options = [""] + get_book_options(df_books[df_books["Status"] != "Stream"])
 
     df_weekly = st.session_state.weekly.copy()
 
     # Ensure computed columns exist for display convenience (but we'll recompute for summary)
     df_weekly = compute_pages_read(df_weekly)
 
-    # Configure dropdowns for session book columns
+    # Configure dropdowns for planned stream vs actual book columns
     col_config = {"Phase": st.column_config.TextColumn("Phase")}
     for label, _req in SESSION_COLS:
-        col_config[f"{label} Book"] = st.column_config.SelectboxColumn(f"{label} Book", options=book_options)
+        col_config[f"{label} Planned"] = st.column_config.SelectboxColumn(
+            f"{label} Planned (stream)", options=planned_options
+        )
+        col_config[f"{label} Actual"] = st.column_config.SelectboxColumn(
+            f"{label} Actual (book)", options=actual_options
+        )
         col_config[f"{label} Start Pg"] = st.column_config.NumberColumn(f"{label} Start Pg", min_value=0, step=1)
         col_config[f"{label} End Pg"] = st.column_config.NumberColumn(f"{label} End Pg", min_value=0, step=1)
         col_config[f"{label} Minutes"] = st.column_config.NumberColumn(f"{label} Minutes", min_value=0, step=5)
@@ -344,7 +388,7 @@ with tabs[1]:
 
     st.session_state.weekly = edited_weekly
 
-    st.caption("Tip: you only need to fill Book + Minutes to follow the plan; Start/End Pg is for progress tracking.")
+    st.caption("Tip: Planned is your target stream; Actual + Start/End Pg track what you truly read.")
 
 # ---- Tab 3: Summary
 with tabs[2]:
