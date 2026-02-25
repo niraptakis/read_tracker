@@ -1,38 +1,31 @@
 # read_tracker
 
-## What is this?
-A local Streamlit web app for generating, tracking, and evolving long-term reading plans with optional Gemini-assisted planning.
+This repo now contains two Streamlit apps:
 
-### How to run:
+1. `app.py`: long-term reading planner and tracker.
+2. `read_app.py`: reading-speed training app focused on faster reading with comprehension retention.
+
+## Setup
 ```bash
-# 1. Create and activate a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 2. Install depndencies
 pip install -r requirements.txt
-
-# 3. Run Streamlit App
-streamlit run app.py
 ```
 
-## Tabs
-- `Book list`: Add and manage streams/books, statuses, page counts, and Gemini planning settings.
-- `Weekly engine`: Follow the weekly plan (`Planned`) and log what you actually read (`Actual`), pages, and minutes.
-- `Summary`: View progress, weekly totals, quick stats, and export/import or save CSV snapshots.
+## Run
+```bash
+# Long-term planning / tracking app
+streamlit run app.py
 
-## How it works
-- You define reading streams and books in `Book list`.
-- If you use Gemini, the app generates a weekly structure and fills `Planned` sessions.
-- In `Weekly engine`, you log real behavior in `Actual` plus `Start Pg`, `End Pg`, and `Minutes`.
-- The app calculates pages per session and weekly totals from your logs.
-- `Summary` aggregates progress by actual book read, so metrics reflect reality, not just the plan.
+# Reading-speed training app
+streamlit run read_app.py
+```
 
-## Long-term usage (recommended)
-- Start with a 12-month plan (or 52 weeks) to create direction.
-- Treat `Planned` as guidance, not a rigid contract.
-- After each reading session, log `Actual` + pages + minutes immediately.
-- Review `Summary` weekly to spot consistency gaps and overload weeks.
-- Every 4-8 weeks, regenerate or adjust the plan based on what you actually finished.
-- Use `Save to disk (manual)` snapshots before major changes so you keep historical versions.
-- Keep streams (`Status = Stream`) separate from concrete books to plan cleanly and track accurately.
+## Docs
+- Planner app docs: this README.
+- Reading trainer docs: see `READ_APP.md`.
+
+## Planner App (`app.py`) Summary
+- `Book list`: manage streams/books, status, pages, notes, and Gemini plan settings.
+- `Weekly engine`: follow planned sessions and log actual reads/pages/minutes.
+- `Summary`: track progress and export/import snapshots.
