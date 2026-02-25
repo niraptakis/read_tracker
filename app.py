@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 import json
 import re
+import os
 
 # Optional LLM support
 try:
@@ -312,7 +313,7 @@ with tabs[0]:
             "Months 7-9: Heavier nonfiction focus, slightly reduce fiction load. " \
             "Months 10-12: Peak narrative momentum (major thriller or GOT push). " \
             "Rules: Avoid repeating identical weekly structures for more than 4 consecutive weeks. " \
-            "Gradually adjust session minutes over the year." \
+            "Gradually adjust session minutes over the year. " \
             "Ensure cognitive balance (no heavy nonfiction immediately after another heavy session). " \
             "Return ONLY valid JSON. No markdown. No commentary. No code fences.",
             height=80,
@@ -429,3 +430,47 @@ with tabs[2]:
     csv_weekly = st.session_state.weekly.to_csv(index=False).encode("utf-8")
     st.download_button("Download Book list CSV", csv_books, file_name="book_list.csv", mime="text/csv")
     st.download_button("Download Weekly engine CSV", csv_weekly, file_name="weekly_engine.csv", mime="text/csv")
+
+    st.divider()
+    st.subheader("Save to disk (manual)")
+
+    save_dir = "saves"
+    os.makedirs(save_dir, exist_ok=True)
+
+    colA, colB = st.columns([1, 3])
+    with colA:
+        save_clicked = st.button("Save now")
+
+    with colB:
+        save_name = st.text_input("Save label (optional)", value="")
+
+    if save_clicked:
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        label = "".join(ch for ch in save_name.strip() if ch.isalnum() or ch in ("-", "_"))
+        label_part = f"_{label}" if label else ""
+
+        books_path = os.path.join(save_dir, f"book_list{label_part}_{ts}.csv")
+        weekly_path = os.path.join(save_dir, f"weekly_engine{label_part}_{ts}.csv")
+
+        st.session_state.books.to_csv(books_path, index=False)
+        st.session_state.weekly.to_csv(weekly_path, index=False)
+
+        st.success(f"Saved:\n- {books_path}\n- {weekly_path}")
+
+    # Import buttons
+    st.divider()
+    st.subheader("Import existing data")
+
+    uploaded_books = st.file_uploader("Upload Book list CSV", type="csv", key="books_upload")
+    uploaded_weekly = st.file_uploader("Upload Weekly engine CSV", type="csv", key="weekly_upload")
+
+    if uploaded_books is not None:
+        df_books_new = pd.read_csv(uploaded_books)
+        st.session_state.books = df_books_new
+        st.success("Book list loaded.")
+
+    if uploaded_weekly is not None:
+        df_weekly_new = pd.read_csv(uploaded_weekly)
+        df_weekly_new = normalize_weekly_schema(df_weekly_new)
+        st.session_state.weekly = df_weekly_new
+        st.success("Weekly engine loaded.")
