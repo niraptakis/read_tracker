@@ -45,10 +45,8 @@ def default_weekly_engine(weeks: int = 52) -> pd.DataFrame:
     for w in range(1, weeks + 1):
         row: Dict[str, Any] = {"Week": w, "Phase": ""}
         for label, _required in SESSION_COLS:
-            # Planned = stream (filled by Gemini)
-            row[f"{label} Planned"] = ""
-            # Actual = real book read during the session
-            row[f"{label} Actual"] = ""
+            # Single book choice per session
+            row[f"{label} Book"] = ""
             row[f"{label} Start Pg"] = None
             row[f"{label} End Pg"] = None
             row[f"{label} Minutes"] = None
@@ -56,7 +54,7 @@ def default_weekly_engine(weeks: int = 52) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def normalize_weekly_schema(df_weekly: pd.DataFrame) -> pd.DataFrame:
-    """Backfill missing planned/actual columns and migrate legacy '* Book' data."""
+    """Backfill missing session columns and migrate legacy planned/actual data to '* Book'."""
     df = df_weekly.copy()
     if "Week" not in df.columns:
         df["Week"] = range(1, len(df) + 1)
@@ -68,20 +66,34 @@ def normalize_weekly_schema(df_weekly: pd.DataFrame) -> pd.DataFrame:
         planned_col = f"{label} Planned"
         actual_col = f"{label} Actual"
 
-        if planned_col not in df.columns:
-            if legacy_book_col in df.columns:
-                df[planned_col] = df[legacy_book_col]
+        if legacy_book_col not in df.columns:
+            if actual_col in df.columns:
+                df[legacy_book_col] = df[actual_col]
+            elif planned_col in df.columns:
+                df[legacy_book_col] = df[planned_col]
             else:
-                df[planned_col] = ""
-        if actual_col not in df.columns:
-            if legacy_book_col in df.columns:
-                df[actual_col] = df[legacy_book_col]
-            else:
-                df[actual_col] = ""
+                df[legacy_book_col] = ""
+
+        # If both existed, prefer Actual when present, otherwise Planned.
+        if actual_col in df.columns or planned_col in df.columns:
+            cur = df[legacy_book_col].fillna("").astype(str).str.strip()
+            if actual_col in df.columns:
+                act = df[actual_col].fillna("").astype(str).str.strip()
+                cur = act.where(act != "", cur)
+            if planned_col in df.columns:
+                pln = df[planned_col].fillna("").astype(str).str.strip()
+                cur = pln.where((cur == "") & (pln != ""), cur)
+            df[legacy_book_col] = cur
 
         for col_name in [f"{label} Start Pg", f"{label} End Pg", f"{label} Minutes"]:
             if col_name not in df.columns:
                 df[col_name] = None
+
+    keep_cols = ["Week", "Phase"]
+    for label, _required in SESSION_COLS:
+        keep_cols.extend([f"{label} Book", f"{label} Start Pg", f"{label} End Pg", f"{label} Minutes"])
+    keep_cols = [c for c in keep_cols if c in df.columns]
+    df = df[keep_cols]
 
     return df
 
@@ -115,7 +127,7 @@ def book_progress(df_books: pd.DataFrame, df_weekly: pd.DataFrame) -> pd.DataFra
     # Build long-form log: (Book, PagesRead)
     logs = []
     for label, _ in SESSION_COLS:
-        b = dfw[f"{label} Actual"].fillna("").astype(str)
+        b = dfw[f"{label} Book"].fillna("").astype(str)
         p = pd.to_numeric(dfw[f"{label} Pages Read"], errors="coerce").fillna(0)
         logs.append(pd.DataFrame({"Book": b, "PagesRead": p}))
     long = pd.concat(logs, ignore_index=True)
@@ -147,6 +159,30 @@ def get_book_options(df_books: pd.DataFrame) -> List[str]:
     return out
 
 
+def upsert_session_row(
+    df_weekly: pd.DataFrame,
+    week: int,
+    session_label: str,
+    book: str,
+    start_pg: int | None,
+    end_pg: int | None,
+    minutes: int | None,
+    phase: str | None = None,
+) -> pd.DataFrame:
+    """Update one session cell-set for a given week and return normalized df."""
+    df = normalize_weekly_schema(df_weekly.copy())
+    if week not in df["Week"].tolist():
+        return df
+    ix = df.index[df["Week"] == week][0]
+    df.at[ix, f"{session_label} Book"] = book or ""
+    df.at[ix, f"{session_label} Start Pg"] = start_pg
+    df.at[ix, f"{session_label} End Pg"] = end_pg
+    df.at[ix, f"{session_label} Minutes"] = minutes
+    if phase is not None:
+        df.at[ix, "Phase"] = phase
+    return normalize_weekly_schema(df)
+
+
 # -----------------------------
 # Gemini helpers (optional)
 # -----------------------------
@@ -161,7 +197,7 @@ def generate_plan_with_gemini(
     preferences: str,
 ) -> pd.DataFrame:
     """
-    Returns a weekly_engine-like DataFrame with Week/Phase and session Planned/Minutes filled.
+    Returns a weekly_engine-like DataFrame with Week/Phase and session Book/Minutes filled.
     Does NOT fill page ranges (user logs those).
     """
     if genai is None:
@@ -181,7 +217,7 @@ Constraints:
 
 Allowed book streams (use only these names exactly):
 {streams}
-These should populate the 'Sx Planned' fields.
+These should populate the 'Sx Book' fields.
 
 Preferences:
 {preferences}
@@ -249,12 +285,12 @@ Output STRICT JSON array, length {weeks}, where each element has:
             slot = s.get("slot", "")
             if slot not in [f"S{i}" for i in range(1, 6)]:
                 continue
-            df.loc[df["Week"] == w, f"{slot} Planned"] = s.get("Book", "")
+            df.loc[df["Week"] == w, f"{slot} Book"] = s.get("Book", "")
             df.loc[df["Week"] == w, f"{slot} Minutes"] = s.get("Minutes", None)
 
         opt = item.get("Optional", None)
         if isinstance(opt, dict):
-            df.loc[df["Week"] == w, "S5 Planned"] = opt.get("Book", "")
+            df.loc[df["Week"] == w, "S5 Book"] = opt.get("Book", "")
             df.loc[df["Week"] == w, "S5 Minutes"] = opt.get("Minutes", None)
 
     return df
@@ -272,7 +308,9 @@ if "books" not in st.session_state:
     st.session_state.books = default_book_list()
 if "weekly" not in st.session_state:
     st.session_state.weekly = default_weekly_engine(weeks=52)
-st.session_state.weekly = normalize_weekly_schema(st.session_state.weekly)
+if "_weekly_schema_normalized" not in st.session_state:
+    st.session_state.weekly = normalize_weekly_schema(st.session_state.weekly)
+    st.session_state._weekly_schema_normalized = True
 
 tabs = st.tabs(["Book list", "Weekly engine", "Summary"])
 
@@ -315,7 +353,8 @@ with tabs[0]:
             "Rules: Avoid repeating identical weekly structures for more than 4 consecutive weeks. " \
             "Gradually adjust session minutes over the year. " \
             "Ensure cognitive balance (no heavy nonfiction immediately after another heavy session). " \
-            "Return ONLY valid JSON. No markdown. No commentary. No code fences.",
+            "Return ONLY valid JSON. No markdown. No commentary. No code fences. " \
+            "Round session minutes to the nearest 10 minutes.",
             height=80,
         )
 
@@ -356,53 +395,73 @@ with tabs[0]:
 # ---- Tab 2: Weekly engine
 with tabs[1]:
     st.subheader("Weekly engine (log sessions)")
+    st.caption("Log sessions with controls below. Table is view-only.")
 
     df_books = st.session_state.books
-    planned_options = [""] + get_book_options(df_books[df_books["Status"] == "Stream"])
-    actual_options = [""] + get_book_options(df_books[df_books["Status"] != "Stream"])
+    book_options = [""] + get_book_options(df_books)
+    session_options = [s for s, _ in SESSION_COLS]
 
-    df_weekly = st.session_state.weekly.copy()
+    df_weekly = normalize_weekly_schema(st.session_state.weekly.copy())
 
-    # Ensure computed columns exist for display convenience (but we'll recompute for summary)
-    df_weekly = compute_pages_read(df_weekly)
+    with st.form("weekly_log_form", clear_on_submit=False):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            selected_week = st.selectbox(
+                "Week",
+                options=df_weekly["Week"].astype(int).tolist(),
+                index=0,
+            )
+            selected_session = st.selectbox("Session", options=session_options, index=0)
+        with c2:
+            start_pg = st.number_input("Start Pg", min_value=0, step=1, value=0)
+            end_pg = st.number_input("End Pg", min_value=0, step=1, value=0)
+            minutes = st.number_input("Minutes", min_value=0, step=5, value=20)
+        with c3:
+            selected_book = st.selectbox("Book", options=book_options, index=0)
+            current_phase = df_weekly.loc[df_weekly["Week"] == selected_week, "Phase"].astype(str).iloc[0]
+            phase = st.text_input("Phase (optional)", value=current_phase)
+        submit_log = st.form_submit_button("Save session log")
 
-    # Configure dropdowns for planned stream vs actual book columns
-    col_config = {"Phase": st.column_config.TextColumn("Phase")}
-    for label, _req in SESSION_COLS:
-        col_config[f"{label} Planned"] = st.column_config.SelectboxColumn(
-            f"{label} Planned (stream)", options=planned_options
-        )
-        col_config[f"{label} Actual"] = st.column_config.SelectboxColumn(
-            f"{label} Actual (book)", options=actual_options
-        )
-        col_config[f"{label} Start Pg"] = st.column_config.NumberColumn(f"{label} Start Pg", min_value=0, step=1)
-        col_config[f"{label} End Pg"] = st.column_config.NumberColumn(f"{label} End Pg", min_value=0, step=1)
-        col_config[f"{label} Minutes"] = st.column_config.NumberColumn(f"{label} Minutes", min_value=0, step=5)
+    if submit_log:
+        if not selected_book.strip():
+            st.error("Choose a book before saving.")
+        elif end_pg > 0 and start_pg > 0 and end_pg < start_pg:
+            st.error("End Pg must be greater than or equal to Start Pg.")
+        else:
+            start_pg_val = int(start_pg) if start_pg > 0 else None
+            end_pg_val = int(end_pg) if end_pg > 0 else None
+            minutes_val = int(minutes) if minutes > 0 else None
+            updated = upsert_session_row(
+                st.session_state.weekly,
+                week=int(selected_week),
+                session_label=selected_session,
+                book=selected_book,
+                start_pg=start_pg_val,
+                end_pg=end_pg_val,
+                minutes=minutes_val,
+                phase=phase,
+            )
+            st.session_state.weekly = updated
+            st.success(f"Saved {selected_session} for Week {selected_week}.")
 
-    edited_weekly = st.data_editor(
-        df_weekly.drop(columns=[f"{label} Pages Read" for label, _ in SESSION_COLS] + ["Week Pages Read", "Week Minutes"]),
-        use_container_width=True,
-        height=600,
-        column_config=col_config,
-        disabled=["Week"],  # keep week fixed
-    )
-
-    st.session_state.weekly = edited_weekly
-
-    st.caption("Tip: Planned is your target stream; Actual + Start/End Pg track what you truly read.")
+    st.markdown("### Weekly engine (view only)")
+    view_df = compute_pages_read(normalize_weekly_schema(st.session_state.weekly.copy()))
+    st.dataframe(view_df, use_container_width=True, height=600)
 
 # ---- Tab 3: Summary
 with tabs[2]:
     st.subheader("Summary")
 
     df_prog = book_progress(st.session_state.books, st.session_state.weekly)
+    df_prog_view = df_prog.copy()
+    df_prog_view["% Progress"] = pd.to_numeric(df_prog_view["% Progress"], errors="coerce") * 100.0
     st.markdown("### Book progress")
     st.dataframe(
-        df_prog,
+        df_prog_view,
         use_container_width=True,
         column_config={
             "% Progress": st.column_config.ProgressColumn(
-                "% Progress", format="%.0f%%", min_value=0.0, max_value=1.0
+                "% Progress", format="%.0f%%", min_value=0.0, max_value=100.0
             )
         },
     )
