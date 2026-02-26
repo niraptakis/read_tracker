@@ -29,8 +29,3 @@ streamlit run read_app.py
 - `Book list`: manage streams/books, status, pages, notes, and Gemini plan settings.
 - `Weekly engine`: follow planned sessions and log actual reads/pages/minutes.
 - `Summary`: track progress and export/import snapshots.
-
-## To Fix
-- Input bugs in the logs.
-- Start and pausing in the training games.
-- Mobile-friendly improvements.

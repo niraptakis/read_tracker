@@ -40,6 +40,18 @@ MODEL_FALLBACK_CANDIDATES = [
     "gemini-1.5-flash-8b",
     "gemini-1.5-pro",
 ]
+LOG_COLUMNS = [
+    "timestamp",
+    "technique",
+    "duration_min",
+    "help_level",
+    "target_wpm",
+    "words",
+    "quiz_score",
+    "quiz_total",
+    "percent",
+    "notes",
+]
 
 
 # -----------------------------
@@ -81,37 +93,61 @@ def now_iso() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
+def normalize_log_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+
+    out = df.copy()
+    for col in LOG_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out = out[LOG_COLUMNS]
+
+    for col in ["duration_min", "target_wpm", "words", "quiz_score", "quiz_total", "percent"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    for col in ["timestamp", "technique", "help_level", "notes"]:
+        out[col] = out[col].fillna("").astype(str)
+
+    return out
+
+
 def ensure_log_exists() -> None:
     if not LOG_PATH.exists():
-        df = pd.DataFrame(
-            columns=[
-                "timestamp",
-                "technique",
-                "duration_min",
-                "help_level",
-                "target_wpm",
-                "words",
-                "quiz_score",
-                "quiz_total",
-                "percent",
-                "notes",
-            ]
-        )
+        df = pd.DataFrame(columns=LOG_COLUMNS)
         df.to_csv(LOG_PATH, index=False)
+        return
+
+    # Keep legacy/malformed files readable by enforcing a stable schema.
+    try:
+        df = pd.read_csv(LOG_PATH)
+    except Exception:
+        pd.DataFrame(columns=LOG_COLUMNS).to_csv(LOG_PATH, index=False)
+        return
+    normalize_log_df(df).to_csv(LOG_PATH, index=False)
 
 
 def load_log() -> pd.DataFrame:
     ensure_log_exists()
     try:
-        return pd.read_csv(LOG_PATH)
+        return normalize_log_df(pd.read_csv(LOG_PATH))
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=LOG_COLUMNS)
 
 
 def append_log(row: Dict[str, Any]) -> None:
-    ensure_log_exists()
-    df = pd.read_csv(LOG_PATH)
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df = load_log()
+    clean_row = {col: row.get(col, pd.NA) for col in LOG_COLUMNS}
+    clean_row["timestamp"] = str(clean_row.get("timestamp") or now_iso())
+    clean_row["technique"] = str(clean_row.get("technique") or "")
+    clean_row["help_level"] = str(clean_row.get("help_level") or "")
+    clean_row["notes"] = str(clean_row.get("notes") or "")
+
+    for col in ["duration_min", "target_wpm", "words", "quiz_score", "quiz_total", "percent"]:
+        clean_row[col] = pd.to_numeric(pd.Series([clean_row[col]]), errors="coerce").iloc[0]
+
+    df = pd.concat([df, pd.DataFrame([clean_row])], ignore_index=True)
+    df = normalize_log_df(df)
     df.to_csv(LOG_PATH, index=False)
 
 
@@ -453,6 +489,107 @@ def _friendly_llm_error(action: str, exc: Exception) -> str:
     return f"Gemini {action} failed; using local text instead."
 
 
+def render_session_timer(duration_min: int, timer_id: str) -> None:
+    total_sec = max(60, int(duration_min * 60))
+    html_doc = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  .timer-wrap {{
+    border-radius: 12px;
+    border: 1px solid rgba(0,0,0,0.10);
+    padding: 10px 12px;
+    margin: 4px 0 12px;
+    background: rgba(0,0,0,0.02);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  }}
+  .timer-display {{
+    font-size: 18px;
+    font-weight: 700;
+    min-width: 90px;
+  }}
+  .timer-btn {{
+    border: 1px solid rgba(0,0,0,0.18);
+    background: white;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }}
+  .timer-note {{
+    font-size: 12px;
+    opacity: 0.75;
+  }}
+  @media (max-width: 768px) {{
+    .timer-display {{ font-size: 16px; }}
+    .timer-btn {{ flex: 1 1 auto; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="timer-wrap">
+    <div class="timer-display" id="timer_{timer_id}">00:00</div>
+    <button class="timer-btn" id="start_{timer_id}">Start</button>
+    <button class="timer-btn" id="pause_{timer_id}">Pause</button>
+    <button class="timer-btn" id="reset_{timer_id}">Reset</button>
+    <div class="timer-note">Session timer ({duration_min} min)</div>
+  </div>
+<script>
+  const total = {total_sec};
+  let remaining = total;
+  let running = false;
+  let h = null;
+
+  const disp = document.getElementById("timer_{timer_id}");
+  const startBtn = document.getElementById("start_{timer_id}");
+  const pauseBtn = document.getElementById("pause_{timer_id}");
+  const resetBtn = document.getElementById("reset_{timer_id}");
+
+  function fmt(sec) {{
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }}
+  function draw() {{ disp.textContent = fmt(remaining); }}
+  function tick() {{
+    if (!running) return;
+    if (remaining <= 0) {{
+      running = false;
+      if (h) clearInterval(h);
+      h = null;
+      draw();
+      return;
+    }}
+    remaining -= 1;
+    draw();
+  }}
+
+  startBtn.onclick = () => {{
+    if (running) return;
+    running = true;
+    if (!h) h = setInterval(tick, 1000);
+  }};
+  pauseBtn.onclick = () => {{
+    running = false;
+  }};
+  resetBtn.onclick = () => {{
+    running = false;
+    remaining = total;
+    draw();
+  }};
+  draw();
+</script>
+</body>
+</html>
+""".strip()
+    st_html(html_doc, height=90, scrolling=False)
+
+
 def render_pacer(text: str, wpm: int) -> None:
     """
     Displays text with a word-by-word moving underline/highlight driven by JS.
@@ -508,27 +645,96 @@ def render_pacer(text: str, wpm: int) -> None:
     opacity: 0.75;
     margin: 8px 0 0 2px;
   }}
+  .controls {{
+    display: flex;
+    gap: 8px;
+    margin: 10px 0 2px;
+    flex-wrap: wrap;
+  }}
+  .btn {{
+    border: 1px solid rgba(0,0,0,0.20);
+    background: white;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }}
+  @media (max-width: 768px) {{
+    .wrap {{
+      font-size: 18px;
+      line-height: 1.45;
+      padding: 10px;
+    }}
+    .btn {{
+      flex: 1 1 auto;
+    }}
+  }}
 </style>
 </head>
 <body>
+  <div class="controls">
+    <button id="start" class="btn">Start</button>
+    <button id="pause" class="btn">Pause</button>
+    <button id="restart" class="btn">Restart</button>
+  </div>
   <div class="wrap" id="wrap">{''.join(spans)}</div>
   <div class="meta">Pacer: {wpm} wpm · approx duration: {total_ms/1000:.0f}s</div>
 
 <script>
   const toks = Array.from(document.querySelectorAll('.tok'));
+  const startBtn = document.getElementById('start');
+  const pauseBtn = document.getElementById('pause');
+  const restartBtn = document.getElementById('restart');
   let i = 0;
-  function step() {{
+  let running = false;
+  let timer = null;
+
+  function paint() {{
     toks.forEach(t => t.classList.remove('active'));
     if (i < toks.length) {{
       toks[i].classList.add('active');
-      // keep the active token in view
       toks[i].scrollIntoView({{block: 'center', inline: 'nearest'}});
-      i += 1;
-      setTimeout(step, {ms_per_word});
     }}
   }}
-  // start after a short pause
-  setTimeout(step, 350);
+
+  function step() {{
+    if (!running) return;
+    paint();
+    i += 1;
+    if (i < toks.length) {{
+      timer = setTimeout(step, {ms_per_word});
+    }} else {{
+      running = false;
+      timer = null;
+    }}
+  }}
+
+  startBtn.onclick = () => {{
+    if (running) return;
+    if (i >= toks.length) i = 0;
+    running = true;
+    step();
+  }};
+
+  pauseBtn.onclick = () => {{
+    running = false;
+    if (timer) {{
+      clearTimeout(timer);
+      timer = null;
+    }}
+  }};
+
+  restartBtn.onclick = () => {{
+    running = false;
+    if (timer) {{
+      clearTimeout(timer);
+      timer = null;
+    }}
+    i = 0;
+    paint();
+  }};
+
+  paint();
 </script>
 </body>
 </html>
@@ -541,6 +747,23 @@ def render_pacer(text: str, wpm: int) -> None:
 # UI
 # -----------------------------
 st.set_page_config(page_title="Reading Trainer (Chunking + Pacer)", layout="wide")
+st.markdown(
+    """
+    <style>
+      @media (max-width: 768px) {
+        .block-container {
+          padding-left: 0.85rem;
+          padding-right: 0.85rem;
+          padding-top: 0.9rem;
+        }
+        div[data-testid="stButton"] > button {
+          width: 100%;
+        }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("Reading Trainer: Chunking (A) + Moving Underline (B)")
 st.caption("Practice in short, deliberate sessions. Comprehension comes first.")
@@ -604,6 +827,7 @@ with tabs[0]:
     passage = st.session_state.get("A_passage", "")
     if passage:
         st.subheader("Reading exercises")
+        render_session_timer(duration_min, "A")
         sents = split_sentences(passage)
 
         # Render each sentence as chunked HTML
@@ -728,6 +952,7 @@ with tabs[1]:
     passage_b = st.session_state.get("B_passage", "")
     if passage_b:
         st.subheader("Pacer")
+        render_session_timer(duration_min_b, "B")
         render_pacer(passage_b, wpm=wpm)
 
         st.subheader("Comprehension check")
@@ -806,6 +1031,9 @@ with tabs[2]:
             default=sorted(df["technique"].dropna().unique().tolist()),
         )
         df2 = df[df["technique"].isin(tech)].copy()
+        df2["percent"] = pd.to_numeric(df2["percent"], errors="coerce")
+        df2["duration_min"] = pd.to_numeric(df2["duration_min"], errors="coerce")
+        df2["words"] = pd.to_numeric(df2["words"], errors="coerce")
 
         st.subheader("Recent sessions")
         st.dataframe(
