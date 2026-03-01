@@ -40,6 +40,25 @@ def default_book_list() -> pd.DataFrame:
         ]
     )
 
+
+def normalize_book_schema(df_books: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Book", "Status", "Total Pages", "Notes"]
+    if df_books is None or df_books.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = df_books.copy()
+    for col in cols:
+        if col not in df.columns:
+            df[col] = "" if col != "Total Pages" else 0
+
+    df = df[cols]
+    df["Book"] = df["Book"].fillna("").astype(str)
+    df["Status"] = df["Status"].fillna("Wishlist").astype(str)
+    df["Status"] = df["Status"].where(df["Status"].isin(BOOK_STATUSES), "Wishlist")
+    df["Total Pages"] = pd.to_numeric(df["Total Pages"], errors="coerce").fillna(0).astype(int)
+    df["Notes"] = df["Notes"].fillna("").astype(str)
+    return df
+
 def default_weekly_engine(weeks: int = 52) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for w in range(1, weeks + 1):
@@ -97,6 +116,7 @@ def normalize_weekly_schema(df_weekly: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+@st.cache_data(show_spinner=False)
 def compute_pages_read(df_weekly: pd.DataFrame) -> pd.DataFrame:
     df = df_weekly.copy()
 
@@ -118,6 +138,7 @@ def compute_pages_read(df_weekly: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+@st.cache_data(show_spinner=False)
 def book_progress(df_books: pd.DataFrame, df_weekly: pd.DataFrame) -> pd.DataFrame:
     """
     Sum Pages Read by matching book name strings in Weekly Engine session columns.
@@ -306,6 +327,8 @@ st.title("Reading Planner (local)")
 # Session state init
 if "books" not in st.session_state:
     st.session_state.books = default_book_list()
+else:
+    st.session_state.books = normalize_book_schema(st.session_state.books)
 if "weekly" not in st.session_state:
     st.session_state.weekly = default_weekly_engine(weeks=52)
 if "_weekly_schema_normalized" not in st.session_state:
@@ -331,7 +354,7 @@ with tabs[0]:
         },
     )
 
-    st.session_state.books = edited
+    st.session_state.books = normalize_book_schema(edited)
 
     st.divider()
     st.subheader("Optional: Gemini setup (only when generating/editing plan)")
@@ -418,9 +441,16 @@ with tabs[1]:
             minutes = st.number_input("Minutes", min_value=0, step=5, value=20)
         with c3:
             selected_book = st.selectbox("Book", options=book_options, index=0)
-            current_phase = df_weekly.loc[df_weekly["Week"] == selected_week, "Phase"].astype(str).iloc[0]
-            phase = st.text_input("Phase (optional)", value=current_phase)
-        submit_log = st.form_submit_button("Save session log")
+            phase = st.text_input("Phase (optional, only if changing)", value="")
+            existing_phase = df_weekly.loc[df_weekly["Week"] == selected_week, "Phase"].astype(str).iloc[0]
+            st.caption(f"Current phase for this week: {existing_phase or '(blank)'}")
+        b1, b2 = st.columns(2)
+        with b1:
+            submit_log = st.form_submit_button("Save session log")
+        with b2:
+            clear_log = st.form_submit_button("Clear selected session")
+
+    phase_val = phase.strip() or None
 
     if submit_log:
         if not selected_book.strip():
@@ -439,10 +469,23 @@ with tabs[1]:
                 start_pg=start_pg_val,
                 end_pg=end_pg_val,
                 minutes=minutes_val,
-                phase=phase,
+                phase=phase_val,
             )
             st.session_state.weekly = updated
             st.success(f"Saved {selected_session} for Week {selected_week}.")
+    elif clear_log:
+        updated = upsert_session_row(
+            st.session_state.weekly,
+            week=int(selected_week),
+            session_label=selected_session,
+            book="",
+            start_pg=None,
+            end_pg=None,
+            minutes=None,
+            phase=phase_val,
+        )
+        st.session_state.weekly = updated
+        st.success(f"Cleared {selected_session} for Week {selected_week}.")
 
     st.markdown("### Weekly engine (view only)")
     view_df = compute_pages_read(normalize_weekly_schema(st.session_state.weekly.copy()))
@@ -524,7 +567,7 @@ with tabs[2]:
     uploaded_weekly = st.file_uploader("Upload Weekly engine CSV", type="csv", key="weekly_upload")
 
     if uploaded_books is not None:
-        df_books_new = pd.read_csv(uploaded_books)
+        df_books_new = normalize_book_schema(pd.read_csv(uploaded_books))
         st.session_state.books = df_books_new
         st.success("Book list loaded.")
 

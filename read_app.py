@@ -116,23 +116,22 @@ def ensure_log_exists() -> None:
     if not LOG_PATH.exists():
         df = pd.DataFrame(columns=LOG_COLUMNS)
         df.to_csv(LOG_PATH, index=False)
-        return
 
-    # Keep legacy/malformed files readable by enforcing a stable schema.
+
+@st.cache_data(show_spinner=False)
+def _read_log_csv(path_str: str, mtime_ns: int) -> pd.DataFrame:
+    del mtime_ns  # cache key only
     try:
-        df = pd.read_csv(LOG_PATH)
+        return normalize_log_df(pd.read_csv(path_str))
     except Exception:
-        pd.DataFrame(columns=LOG_COLUMNS).to_csv(LOG_PATH, index=False)
-        return
-    normalize_log_df(df).to_csv(LOG_PATH, index=False)
+        return pd.DataFrame(columns=LOG_COLUMNS)
 
 
 def load_log() -> pd.DataFrame:
     ensure_log_exists()
-    try:
-        return normalize_log_df(pd.read_csv(LOG_PATH))
-    except Exception:
+    if not LOG_PATH.exists():
         return pd.DataFrame(columns=LOG_COLUMNS)
+    return _read_log_csv(str(LOG_PATH), LOG_PATH.stat().st_mtime_ns)
 
 
 def append_log(row: Dict[str, Any]) -> None:
@@ -590,10 +589,8 @@ def render_session_timer(duration_min: int, timer_id: str) -> None:
     st_html(html_doc, height=90, scrolling=False)
 
 
-def render_pacer(text: str, wpm: int) -> None:
-    """
-    Displays text with a word-by-word moving underline/highlight driven by JS.
-    """
+@st.cache_data(show_spinner=False)
+def _build_pacer_html(text: str, wpm: int) -> str:
     words = re.findall(r"\b[\w']+\b|[^\w\s]", text, re.UNICODE)
     # Wrap each token in a span
     spans = []
@@ -739,6 +736,15 @@ def render_pacer(text: str, wpm: int) -> None:
 </body>
 </html>
 """.strip()
+
+    return html_doc
+
+
+def render_pacer(text: str, wpm: int) -> None:
+    """
+    Displays text with a word-by-word moving underline/highlight driven by JS.
+    """
+    html_doc = _build_pacer_html(text, wpm)
 
     st_html(html_doc, height=420, scrolling=True)
 
